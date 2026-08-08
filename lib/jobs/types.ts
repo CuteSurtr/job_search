@@ -1,0 +1,70 @@
+/** Shared shape of the feed, imported by both the route handlers and the UI. */
+
+export type JobSetting = "Residency" | "Staff RN" | "Fellowship";
+
+export type Job = {
+  id: string;
+  title: string;
+  hospital: string;
+  /** Source registry key, sent back to /api/jobs/detail. */
+  sourceKey: string;
+  /** Workday external path, sent back to /api/jobs/detail. */
+  path: string;
+  city: string;
+  state: string;
+  location: string;
+  specialty: string;
+  setting: JobSetting;
+  /** Hourly rate used for filtering and sorting; null when the posting omits pay. */
+  pay: number | null;
+  payLabel: string;
+  postedMinutes: number;
+  postedLabel: string;
+  shift: string;
+  start: string;
+  license: string;
+  source: string;
+  accent: string;
+  summary: string;
+  employerUrl: string;
+  requisition: string | null;
+  /** False when the listing came from search alone and still needs a detail fetch. */
+  enriched: boolean;
+  /** When this tracker first saw the posting. Null when history is unavailable. */
+  firstSeenAt?: string | null;
+};
+
+export type JobDetail = {
+  id: string;
+  title: string;
+  location: string;
+  payLabel: string;
+  pay: number | null;
+  shift: string;
+  start: string;
+  license: string;
+  postedLabel: string;
+  summary: string;
+  /** Full plain-text posting body. */
+  description: string;
+  /** Requirement-like lines pulled out of the description. */
+  highlights: string[];
+  employerUrl: string;
+};
+
+export type FeedMeta = {
+  updatedAt: string;
+  nextRefreshAt: string;
+  sourceCount: number;
+  successfulSources: number;
+  failedSources: string[];
+  failureReasons: { source: string; reason: string }[];
+  enrichedCount: number;
+  /** True when D1 sighting history backed this scan's posting ages. */
+  historyTracked?: boolean;
+  /** Every state where at least one polled employer operates. */
+  coveredStates?: string[];
+  cacheSeconds: number;
+};
+
+export type JobFeed = { jobs: Job[]; meta: FeedMeta };
