@@ -226,6 +226,55 @@ of the three is missing or if a card cites an aggregator instead of the
 publisher. When updating a figure, change its `period` and the module's
 `STATISTICS_RETRIEVED` date in the same edit.
 
+## Visa sponsorship
+
+`lib/content/sponsorship.mjs` records what is actually known about each
+employer's sponsorship position. It is short, mostly negative space, and that is
+the point.
+
+**Sponsorship cannot be scraped from this feed.** A sample of 90 live postings
+with full description bodies (median ~4,700 characters) found **one** that
+mentioned sponsorship, visas, work authorisation or OPT at all, and **zero**
+that stated a position either way. Employer nursing-careers pages are equally
+silent. Only aggregator blogs assert that a given hospital sponsors, and they
+cite nothing.
+
+There is a structural reason. Registered nursing is a Schedule A shortage
+occupation, so a sponsoring employer skips PERM labour certification and files
+the I-140 straight with USCIS — nothing reaches the Department of Labor, so no
+public disclosure trail exists. A hospital also has no reason to advertise
+sponsorship on a new-graduate requisition.
+
+So the feature does the only honest thing available: it can **remove postings
+that rule sponsorship out**, and it cannot tell you who sponsors. Three rules
+are enforced by `tests/sponsorship.test.mjs`:
+
+- **A claim needs a citation.** `documented`, `reported` and `excluded` each
+  require a source and an https link, and the link may not point at a jobs
+  aggregator. `unknown` must carry neither, because there is nothing to cite.
+- **Absent is not the same as unknown.** An employer with no entry has *not been
+  checked*; an `unknown` entry has been checked and nothing was found. Same
+  distinction the state filter already makes between "no employer covers this
+  state" and "covered, nothing listed right now".
+- **Nothing is inferred from size, prestige or state.** A large academic system
+  that plausibly sponsors stays `unknown` until it says so somewhere citable.
+
+Two ordering rules in the code carry the risk:
+
+- `sponsorshipFromText` tests exclusion **before** anything positive. "Must be
+  authorized to work without sponsorship" contains the word, and a positive
+  matcher running first would read a refusal as an offer — the worst mistake
+  available here, since it sends someone to apply for a job that already ruled
+  them out.
+- The digest filter drops only `excluded`. Treating undocumented as a refusal
+  would empty the digest and leave a subscriber concluding nobody is hiring,
+  rather than that nobody says.
+
+Nursing OPT is twelve months with no STEM extension. An application sent to an
+employer that was never going to sponsor is a slice of that runway gone, which
+is why this file would rather say "we do not know" a hundred times than guess
+once.
+
 ## Layout
 
 - `app/` — the site: `jobs-client.tsx` is the whole UI, `api/` holds the routes
@@ -237,7 +286,8 @@ publisher. When updating a figure, change its `period` and the module's
 - `tests/` — `job-matching` covers the parsers, `ats` the two-ATS registry and
   the Oracle adapter's normalisation, `feed-policy` the cache decisions,
   `history` the Postgres semantics against PGlite, `alerts` the subscription and
-  digest rules, `statistics` the sourcing rules for the published figures.
+  digest rules, `statistics` and `sponsorship` the sourcing rules for anything
+  claimed rather than scraped.
 - `tests/http-routes.test.mjs` is the only suite that needs the build: it boots
   one `next start` and drives request validation, the alert routes, the cron
   guard and the server-rendered shell over HTTP. No network beyond localhost.

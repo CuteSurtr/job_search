@@ -28,6 +28,15 @@ export type Job = {
   summary: string;
   employerUrl: string;
   requisition: string | null;
+  /**
+   * Visa sponsorship position, from the posting body where it says anything and
+   * otherwise from the curated employer registry.
+   *
+   * `unchecked` means nobody has researched that employer — deliberately
+   * distinct from `unknown`, which means we looked and found no published
+   * position. Neither is a "no".
+   */
+  sponsorship: "documented" | "reported" | "excluded" | "unknown" | "unchecked";
   /** False when the listing came from search alone and still needs a detail fetch. */
   enriched: boolean;
   /** When this tracker first saw the posting. Null when history is unavailable. */

@@ -50,6 +50,7 @@ type Filters = {
   since: string;
   sort: string;
   residencyOnly: boolean;
+  hideNoSponsor: boolean;
   showSaved: boolean;
 };
 
@@ -62,6 +63,7 @@ const DEFAULT_FILTERS: Filters = {
   since: "any",
   sort: "Newest",
   residencyOnly: false,
+  hideNoSponsor: false,
   showSaved: false,
 };
 
@@ -140,6 +142,7 @@ function filtersFromSearch(search: string): Partial<Filters> {
   if (params.get("since")) next.since = params.get("since") as string;
   if (params.get("sort")) next.sort = params.get("sort") as string;
   if (params.get("residency") === "1") next.residencyOnly = true;
+  if (params.get("sponsor") === "1") next.hideNoSponsor = true;
   if (params.get("saved") === "1") next.showSaved = true;
   return next;
 }
@@ -154,6 +157,7 @@ function searchFromFilters(filters: Filters): string {
   if (filters.since !== "any") params.set("since", filters.since);
   if (filters.sort !== "Newest") params.set("sort", filters.sort);
   if (filters.residencyOnly) params.set("residency", "1");
+  if (filters.hideNoSponsor) params.set("sponsor", "1");
   if (filters.showSaved) params.set("saved", "1");
   const query = params.toString();
   return query ? `?${query}` : "";
@@ -351,7 +355,8 @@ export function JobsClient() {
           (filters.setting === ANY_PATH || job.setting === filters.setting) &&
           (minPay === 0 || (job.pay !== null && job.pay >= minPay)) &&
           job.postedMinutes <= sinceMinutes &&
-          (!filters.residencyOnly || job.setting === "Residency")
+          (!filters.residencyOnly || job.setting === "Residency") &&
+          (!filters.hideNoSponsor || job.sponsorship !== "excluded")
         );
       })
       .sort((a, b) => {
@@ -487,6 +492,7 @@ export function JobsClient() {
               setting: filters.setting === ANY_PATH ? null : filters.setting,
               minPay: Number(filters.minPay) || null,
               residencyOnly: filters.residencyOnly,
+              hideNoSponsor: filters.hideNoSponsor,
             },
           }),
         });
@@ -644,6 +650,16 @@ export function JobsClient() {
               <input type="checkbox" checked={filters.residencyOnly} onChange={(event) => setFilter("residencyOnly", event.target.checked)} />
               <i aria-hidden="true" />
             </label>
+            <label className="switch-row">
+              <span><strong>Hide roles that rule out sponsorship</strong><small>Only postings that say so in writing</small></span>
+              <input type="checkbox" checked={filters.hideNoSponsor} onChange={(event) => setFilter("hideNoSponsor", event.target.checked)} />
+              <i aria-hidden="true" />
+            </label>
+            <small className="filter-hint sponsor-hint">
+              Almost no hospital states a visa position on a new-grad posting, so this can only
+              remove the ones that rule it out — it cannot show you who sponsors. Nothing here is
+              inferred: a role is only marked either way when the posting or the employer says so.
+            </small>
             <div className="scan-card">
               <span className={`scan-icon ${refreshing ? "spinning" : ""}`} aria-hidden="true">↻</span>
               <div><strong>Source refresh {nextScanLabel === "due now" ? "due now" : `in ${nextScanLabel}`}</strong><small>Last checked {syncLabel}</small></div>
@@ -677,6 +693,7 @@ export function JobsClient() {
               {filters.since !== "any" && <button onClick={() => setFilter("since", "any")}>{POSTED_WINDOWS.find((window) => window.value === filters.since)?.label} ×</button>}
               {Number(filters.minPay) > 0 && <button onClick={() => setFilter("minPay", "0")}>${filters.minPay}+/hr ×</button>}
               {filters.residencyOnly && <button onClick={() => setFilter("residencyOnly", false)}>Residencies only ×</button>}
+              {filters.hideNoSponsor && <button onClick={() => setFilter("hideNoSponsor", false)}>Sponsorship not ruled out ×</button>}
               {!loading && filteredJobs.length > 0 && (
                 <button className="share-chip" onClick={() => void shareSearch()}>{copied ? "Link copied ✓" : "Copy search link"}</button>
               )}
@@ -709,6 +726,8 @@ export function JobsClient() {
                         <div className="job-badges">
                           <span className="verified">New-grad match</span>
                           <span>{job.setting}</span>
+                          {job.sponsorship === "excluded" && <span className="no-sponsor">Rules out sponsorship</span>}
+                          {job.sponsorship === "documented" && <span className="sponsors">Sponsorship documented</span>}
                           {job.postedMinutes <= 24 * 60 && <span className="hot">New today</span>}
                           {isNewToYou(job) && <span className="fresh">New to you</span>}
                           {filters.showSaved && !liveIds.has(job.id) && <span className="stale">Not in current feed</span>}

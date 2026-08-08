@@ -349,6 +349,12 @@ a { color: inherit; text-decoration: none; }
 .job-badges .hot { background: #fff0e9; color: #b9472c; }
 .job-badges .stale { background: #f1eee6; color: #85704a; }
 .job-badges .fresh { background: #e6f0ff; color: #2f5aa8; }
+/* Sponsorship. Only the two informative states get a badge — marking all 157
+   cards "not documented" would be noise, and the sidebar already explains that
+   silence is the norm rather than a signal. */
+.job-badges .no-sponsor { background: #f7e7e7; color: #94393a; }
+.job-badges .sponsors { background: #e3efe7; color: #2c6b47; }
+.sponsor-hint { display: block; margin-top: -4px; line-height: 1.5; }
 .visit-note { margin: 0 0 14px; padding: 11px 14px; border: 1px solid #cfe0f7; border-radius: 10px; background: #eef4ff; color: #2f5aa8; font-size: 12px; }
 .job-title-block h3 { margin: 0 0 5px; font-size: 18px; line-height: 1.3; letter-spacing: -0.025em; }
 .job-title-block h3 button { border: 0; padding: 0; background: transparent; font-weight: 690; text-align: left; cursor: pointer; }

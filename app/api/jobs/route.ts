@@ -14,11 +14,13 @@ import {
   postedMinutes,
   settingFromTitle,
   specialtyFromTitle,
+  sponsorshipFromText,
   stableId,
   stateFromTitle,
   stripHtml,
   summaryFromText,
 } from "@/lib/jobs/matching.mjs";
+import { resolveSponsorship } from "@/lib/content/sponsorship.mjs";
 import { ageMinutes, recordSighting } from "@/lib/jobs/history.mjs";
 import { COVERED_STATES, SEARCH_TERMS, SOURCES } from "@/lib/jobs/sources.mjs";
 import { employerUrlFor, fetchDetailFor, fetchPostingsFor } from "@/lib/jobs/ats.mjs";
@@ -181,6 +183,10 @@ async function buildFeed(): Promise<JobFeed> {
           : `A current ${source.name} posting whose title matches a new graduate nursing pathway. Open the role for full requirements.`,
         employerUrl,
         requisition: posting.bulletFields?.[0] ?? null,
+        // Only an enriched posting has a body to read a position out of. An
+        // un-enriched one falls back to the employer record rather than being
+        // reported as silent on a description nobody fetched.
+        sponsorship: resolveSponsorship(detail ? sponsorshipFromText(description) : null, source.key),
         enriched: Boolean(detail),
       };
     },

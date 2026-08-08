@@ -65,29 +65,37 @@ test("filters are reduced to known fields only", () => {
     setting: "Residency",
     minPay: 35,
     residencyOnly: true,
+    hideNoSponsor: true,
     // Anything else must not survive into stored state.
     isAdmin: true,
     __proto__: { polluted: true },
     email: "attacker@example.com",
   });
-  assert.deepEqual(Object.keys(cleaned).sort(), ["minPay", "residencyOnly", "setting", "specialty", "state"]);
+  assert.deepEqual(Object.keys(cleaned).sort(), [
+    "hideNoSponsor", "minPay", "residencyOnly", "setting", "specialty", "state",
+  ]);
   assert.equal(cleaned.state, "LA");
   assert.equal(cleaned.minPay, 35);
   assert.equal(cleaned.residencyOnly, true);
+  assert.equal(cleaned.hideNoSponsor, true);
 });
 
 test("nonsense filter values become no filter at all", () => {
-  const cleaned = sanitizeFilters({ state: "", specialty: "x".repeat(500), minPay: -5, residencyOnly: "yes" });
+  const cleaned = sanitizeFilters({
+    state: "", specialty: "x".repeat(500), minPay: -5, residencyOnly: "yes", hideNoSponsor: "1",
+  });
   assert.equal(cleaned.state, null);
   assert.equal(cleaned.specialty, null);
   assert.equal(cleaned.minPay, null);
   assert.equal(cleaned.residencyOnly, false, "only a real boolean counts");
+  assert.equal(cleaned.hideNoSponsor, false, "only a real boolean counts");
   assert.deepEqual(sanitizeFilters(null), {
     state: null,
     specialty: null,
     setting: null,
     minPay: null,
     residencyOnly: false,
+    hideNoSponsor: false,
   });
 });
 
@@ -104,6 +112,24 @@ test("a pay floor excludes postings that publish no rate", () => {
   const filters = sanitizeFilters({ minPay: 30 });
   assert.equal(jobMatchesFilters(job({ pay: null }), filters), false);
   assert.equal(jobMatchesFilters(job({ pay: null }), sanitizeFilters({})), true);
+});
+
+test("the sponsorship filter drops only what a posting rules out in writing", () => {
+  const filters = sanitizeFilters({ hideNoSponsor: true });
+
+  // The one case it exists for.
+  assert.equal(jobMatchesFilters(job({ sponsorship: "excluded" }), filters), false);
+
+  // Everything else survives. Almost every posting is silent on the subject, so
+  // treating undocumented as a "no" would empty the digest entirely — the
+  // subscriber would conclude nobody is hiring rather than that nobody says.
+  for (const status of ["documented", "reported", "unknown", "unchecked", undefined]) {
+    assert.equal(
+      jobMatchesFilters(job({ sponsorship: status }), filters),
+      true,
+      `${String(status)} must not be treated as a refusal`,
+    );
+  }
 });
 
 test("residency-only excludes staff roles", () => {
