@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { index, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, pgTable, text, timestamp } from "drizzle-orm/pg-core";
 
 /**
  * Sighting history for job postings.
@@ -11,9 +11,14 @@ import { index, sqliteTable, text } from "drizzle-orm/sqlite-core";
  * it from the list.
  *
  * This table is an enhancement, never a dependency — the feed is fully
- * functional when the D1 binding is absent (see lib/jobs/history.mjs).
+ * functional with no database configured at all (see lib/jobs/history.mjs).
+ *
+ * Timestamps are real `timestamptz` rather than the ISO strings this carried on
+ * SQLite. Postgres has the type, comparisons no longer depend on lexicographic
+ * ordering happening to match chronological ordering, and the application layer
+ * still exchanges ISO strings at its boundaries.
  */
-export const jobSightings = sqliteTable(
+export const jobSightings = pgTable(
   "job_sightings",
   {
     /** Stable FNV-1a hash of the employer URL, matching Job.id in the feed. */
@@ -25,15 +30,21 @@ export const jobSightings = sqliteTable(
     specialty: text("specialty").notNull().default("General Residency"),
     employerUrl: text("employer_url").notNull().default(""),
     /** When this posting was first seen in any scan — the honest "posted" date. */
-    firstSeenAt: text("first_seen_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true })
+      .notNull()
+      .default(sql`now()`),
     /** Updated on every scan that still returns the posting. */
-    lastSeenAt: text("last_seen_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true })
+      .notNull()
+      .default(sql`now()`),
     /** Set once the posting stops appearing; null while it is still listed. */
-    closedAt: text("closed_at"),
+    closedAt: timestamp("closed_at", { withTimezone: true }),
   },
   (table) => [
     index("job_sightings_first_seen_idx").on(table.firstSeenAt),
     index("job_sightings_last_seen_idx").on(table.lastSeenAt),
+    // closeMissing filters on source_key and closed_at together on every scan.
+    index("job_sightings_source_open_idx").on(table.sourceKey, table.closedAt),
   ],
 );
 
@@ -47,7 +58,7 @@ export type JobSighting = typeof jobSightings.$inferSelect;
  * capability secret behind both the confirm and unsubscribe URLs, so it is
  * random per subscription and never derived from the address.
  */
-export const alertSubscriptions = sqliteTable(
+export const alertSubscriptions = pgTable(
   "alert_subscriptions",
   {
     id: text("id").primaryKey(),
@@ -59,10 +70,12 @@ export const alertSubscriptions = sqliteTable(
     status: text("status", { enum: ["pending", "confirmed", "unsubscribed"] })
       .notNull()
       .default("pending"),
-    createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-    confirmedAt: text("confirmed_at"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`now()`),
+    confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
     /** Digest watermark: only postings first seen after this are sent. */
-    lastSentAt: text("last_sent_at"),
+    lastSentAt: timestamp("last_sent_at", { withTimezone: true }),
   },
   (table) => [
     index("alert_subscriptions_status_idx").on(table.status),

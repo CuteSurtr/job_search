@@ -1,5 +1,5 @@
-import { getRequestExecutionContext } from "vinext/shims/request-context";
-import { readCacheEntry, writeCache } from "@/lib/jobs/cache.mjs";
+import { after } from "next/server";
+import { readCacheEntry, sharedCacheConfigured, writeCache } from "@/lib/jobs/cache.mjs";
 import {
   FEED_FRESH_SECONDS,
   FEED_SERVE_SECONDS,
@@ -19,7 +19,6 @@ import {
   stripHtml,
   summaryFromText,
 } from "@/lib/jobs/matching.mjs";
-import { runDigests } from "@/lib/jobs/digest.mjs";
 import { ageMinutes, recordSighting } from "@/lib/jobs/history.mjs";
 import { COVERED_STATES, SEARCH_TERMS, SOURCES } from "@/lib/jobs/sources.mjs";
 import { employerUrlFor, fetchDetailFor, fetchPostingsFor } from "@/lib/jobs/ats.mjs";
@@ -216,6 +215,9 @@ async function buildFeed(): Promise<JobFeed> {
       })),
       enrichedCount: tracked.filter((job) => job.enriched).length,
       historyTracked: firstSeen !== null,
+      // Without a shared cache every cold instance rebuilds from scratch, so
+      // this is the difference between one scan an hour and one per instance.
+      sharedCache: sharedCacheConfigured(),
       coveredStates: COVERED_STATES,
       cacheSeconds: FEED_FRESH_SECONDS,
     },
@@ -228,20 +230,13 @@ async function buildFeed(): Promise<JobFeed> {
  */
 let inFlightRebuild: Promise<JobFeed> | null = null;
 
-function rebuildOnce(origin: string): Promise<JobFeed> {
+function rebuildOnce(): Promise<JobFeed> {
   if (inFlightRebuild) return inFlightRebuild;
   inFlightRebuild = buildFeed()
     .then(async (feed) => {
       // Only a feed that actually found something is worth keeping. Caching a
       // total upstream outage would strand the site on an empty list.
       if (feed.jobs.length > 0) await writeCache(FEED_CACHE_KEY, feed, FEED_SERVE_SECONDS);
-      // No Cron Triggers on this platform, so digests ride along with the scan
-      // that produced the roles they announce. Never allowed to fail the feed.
-      try {
-        await runDigests(feed.jobs, origin);
-      } catch (error) {
-        console.error("[digest] run failed:", error);
-      }
       return feed;
     })
     .finally(() => {
@@ -251,16 +246,23 @@ function rebuildOnce(origin: string): Promise<JobFeed> {
 }
 
 /**
- * Schedule a rebuild that outlives this response. `waitUntil` keeps the isolate
- * alive until it finishes; without it (Node dev, or outside a request scope)
- * the promise is left to run on a best-effort basis instead.
+ * Schedule a rebuild that outlives this response. `after` keeps the serverless
+ * invocation alive until the work settles, which is what stops a background
+ * refresh being killed the moment the response is flushed.
+ *
+ * Called outside a request scope (a test importing the module directly) `after`
+ * throws, so the promise is simply left to run best-effort instead.
  */
-function rebuildInBackground(origin: string) {
-  const promise = rebuildOnce(origin);
-  getRequestExecutionContext()?.waitUntil(promise);
+function rebuildInBackground() {
+  const promise = rebuildOnce();
   promise.catch(() => {
     // A failed background refresh just means the stale feed is served again.
   });
+  try {
+    after(promise);
+  } catch {
+    // No request scope; the rebuild still runs, it just is not awaited.
+  }
 }
 
 export async function GET(request: Request) {
@@ -270,13 +272,13 @@ export async function GET(request: Request) {
   const action = decideFeedAction(entry, wantsRefresh);
 
   if (blocksOnRebuild(action)) {
-    return feedResponse(await rebuildOnce(url.origin), action === "refresh" ? "refreshed" : "miss");
+    return feedResponse(await rebuildOnce(), action === "refresh" ? "refreshed" : "miss");
   }
 
   if (action === "stale") {
     // Serve what we have now and refresh behind it, so the visitor who happens
     // to arrive after expiry is not the one who pays for the scan.
-    rebuildInBackground(url.origin);
+    rebuildInBackground();
     return feedResponse((entry as { value: JobFeed }).value, "stale");
   }
 

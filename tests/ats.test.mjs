@@ -12,6 +12,7 @@ import {
   postedLabelFromDate,
 } from "../lib/jobs/oracle.mjs";
 import { COVERED_STATES, SOURCES, SOURCES_BY_KEY } from "../lib/jobs/sources.mjs";
+import { ACCEPT_LANGUAGE } from "../lib/jobs/workday.mjs";
 import { US_STATES, normalizeLocation, postedMinutes } from "../lib/jobs/matching.mjs";
 
 /**
@@ -255,4 +256,41 @@ test("oracle detail maps onto the shared detail shape and joins its description 
 test("oracle detail returns null when the requisition is gone", () => {
   assert.equal(normalizeOracleDetail({}, providence, "/job/1"), null);
   assert.equal(normalizeOracleDetail({ items: [] }, providence, "/job/1"), null);
+});
+
+/**
+ * Regression guard. Node's fetch defaults `Accept-Language` to `*`, and at
+ * least one tenant's WAF (WVU Medicine) answers that with an opaque HTTP 500 —
+ * costing an entire state's coverage while every other employer keeps working.
+ * The header looks like noise and is not.
+ */
+test("a concrete Accept-Language is sent, never undici's `*` default", () => {
+  assert.notEqual(ACCEPT_LANGUAGE, "*", "`*` is the value that trips the WAF");
+  assert.match(ACCEPT_LANGUAGE, /^[a-z]{2}(-[A-Z]{2})?(,|$)/, "must name a real language");
+});
+
+test("both ATS clients send that header on every upstream call", async () => {
+  const seen = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    seen.push(new Headers(init?.headers).get("accept-language"));
+    return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+  };
+
+  try {
+    const budget = { spend: () => true, remaining: () => 10, expired: () => false };
+    const { fetchAllPostings } = await import("../lib/jobs/workday.mjs");
+    const { fetchAllOraclePostings, fetchOracleDetail } = await import("../lib/jobs/oracle.mjs");
+
+    await fetchAllPostings(ochsner, "nurse residency", { budget, maxPages: 1 });
+    await fetchAllOraclePostings(providence, "nurse residency", { budget, maxPages: 1 });
+    await fetchOracleDetail(providence, "/job/1", budget);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  assert.ok(seen.length >= 3, `expected upstream calls, saw ${seen.length}`);
+  for (const value of seen) {
+    assert.equal(value, ACCEPT_LANGUAGE, "an upstream call went out without the header");
+  }
 });

@@ -3,8 +3,12 @@
 A new-graduate nursing job tracker. It polls the public career-site feeds of 38
 hospital systems across two applicant tracking systems, keeps only postings that
 name a genuine new-grad pathway, and links each one back to the employer's own
-application. Built on [vinext](https://github.com/cloudflare/vinext) and
-deployed as a Cloudflare Worker.
+application. Next.js App Router, deployed on Vercel.
+
+Everything past the feed is optional. With no environment configured at all the
+site builds, deploys and serves live jobs; each variable in `.env.example` turns
+on one capability, and `/api/jobs` reports in its `meta` which are active rather
+than pretending.
 
 ## Geographic coverage
 
@@ -54,11 +58,25 @@ reading it as Oregon filed Ohio residencies under an Oregon filter.
 
 ```bash
 npm install
+cp .env.example .env.local   # optional; every variable in it is optional too
 npm run dev
-npm run build
 ```
 
-This project does not use `wrangler.jsonc`.
+## Deploying to Vercel
+
+Import the repository and deploy — no build configuration needed, and no
+environment variables required to get a working site. Then add capabilities as
+you want them:
+
+| Set | To get |
+| --- | --- |
+| `KV_REST_API_URL` + `KV_REST_API_TOKEN` | A cache shared across instances. Attach Vercel KV, or use `UPSTASH_REDIS_REST_*`. Do this one first — see below. |
+| `DATABASE_URL` | Truthful posting ages, the "new since your last visit" badge, and closed-role flags. Run `npm run db:migrate` once. |
+| `RESEND_API_KEY` + `ALERTS_FROM_EMAIL` | Email digests (also needs `DATABASE_URL`). |
+| `CRON_SECRET` | Lets the scheduled digest in `vercel.json` actually run. |
+
+`meta` on `/api/jobs` reports `sharedCache` and `historyTracked`, so you can
+confirm from the response which of these are live.
 
 ## How the feed works
 
@@ -78,10 +96,15 @@ goes through it. Adding a third ATS means four new branches and nothing else.
   delimited string rather than ordinary query parameters, so the keyword is
   URL-encoded before it goes in: an unescaped `;` or `,` in a search term would
   terminate the argument early and change the query.
-- **A Worker request has a finite subrequest allowance.** Every upstream call is
-  drawn from an explicit budget, and the feed degrades to un-enriched listings
-  rather than failing when the budget runs out. Both clients honour the same
-  budget contract.
+- **A single invocation has finite time.** Every upstream call is drawn from an
+  explicit budget, and the feed degrades to un-enriched listings rather than
+  failing when the budget runs out. Both clients honour the same contract.
+- **`Accept-Language` is sent explicitly, and removing it breaks a state.**
+  Node's `fetch` defaults the header to `*`, and WVU Medicine's WAF answers that
+  with an opaque HTTP 500 while every other tenant tolerates it — so West
+  Virginia silently loses its only source. The same request succeeds from curl
+  and from a browser, which is what makes it hard to find. `tests/ats.test.mjs`
+  asserts both the value and that every upstream call carries it.
 
 Two normalisations happen at the Oracle boundary so nothing downstream needs a
 second code path:
@@ -107,12 +130,18 @@ Routes:
 | `GET /api/alerts/confirm?token=` | Completes double opt-in from the emailed link. |
 | `GET /api/alerts/unsubscribe?token=` | One-click unsubscribe from any digest. |
 
-Caching is two-layer (`lib/jobs/cache.mjs`): a module-scoped map that survives
-between requests in one isolate, plus the Workers Cache API where it exists. A
-feed that found nothing is never cached, so an upstream outage cannot strand the
-site on an empty list.
+Caching is two-layer (`lib/jobs/cache.mjs`): a module-scoped map, plus Redis over
+its REST API when `KV_REST_API_*` or `UPSTASH_REDIS_REST_*` are set. A feed that
+found nothing is never cached, so an upstream outage cannot strand the site on an
+empty list.
 
-## Sighting history (optional D1)
+**The shared layer matters more here than it did on Workers.** A module-scoped
+map is per instance, and Vercel runs many — without Redis every cold start
+re-scans all 38 employers, which is slow for that visitor and a burst of traffic
+at hospital career sites that never asked for it. `meta.sharedCache` reports
+whether it is configured.
+
+## Sighting history (optional Postgres)
 
 Workday reports posting age only as vague prose ("Posted 30+ Days Ago") and says
 nothing at all once a listing disappears. `job_sightings` records what each scan
@@ -120,32 +149,28 @@ saw and when, which turns both into real data: a truthful posting age, a "new
 since your last visit" badge, and a closed flag instead of a role silently
 vanishing.
 
-`bindings.json` declares `"d1": "DB"`, and `npm run db:generate` has already
-produced `drizzle/0000_glorious_bug.sql`. The build copies `drizzle/` to
-`dist/migrations/` so a deploy can apply it against a fresh database.
+Set `DATABASE_URL` to any Postgres — Neon, Supabase, Vercel Postgres, RDS — and
+apply the schema with `npm run db:migrate`. Use the **pooled** connection string
+on serverless: `lib/db.mjs` opens one connection per instance with prepared
+statements disabled, which is what a transaction-mode pooler requires.
 
 **This is an enhancement, never a dependency.** `lib/jobs/history.mjs` catches
-everything and returns null, so a missing binding, an unmigrated table, or a
+everything and returns null, so no `DATABASE_URL`, an unmigrated table, or a
 failed write all degrade to employer-reported ages with the feed intact. The
 `meta.historyTracked` flag in `/api/jobs` tells you which mode a response came
 from. Failures are logged rather than swallowed — a dead feature that looks
-exactly like "D1 was never bound" is the failure mode worth avoiding.
+exactly like "no database was configured" is the failure mode worth avoiding.
 
 Two constraints are load-bearing and covered by tests:
 
-- **D1 rejects statements binding more than 100 variables.** Batch sizes are
-  derived from the column count for that reason. Local SQLite allows ~32k, so an
-  oversized batch passes every test and fails only in production — which is
-  exactly what happened at 60 rows (600 variables). `tests/history.test.mjs`
-  asserts the ceiling directly.
 - **Closing is scoped to sources that answered.** Otherwise one employer being
   briefly unreachable would mass-close every role they list.
+- **`first_seen_at` survives every upsert.** That column is the entire point of
+  the table; overwriting it would silently reset every posting's age.
 
-To apply the migration to the local dev database:
-
-```bash
-node -e "const{DatabaseSync}=require('node:sqlite');const fs=require('node:fs');const f=fs.readdirSync('.wrangler/state/v3/d1/miniflare-D1DatabaseObject').find(n=>n.endsWith('.sqlite')&&n!=='metadata.sqlite');const db=new DatabaseSync('.wrangler/state/v3/d1/miniflare-D1DatabaseObject/'+f);for(const s of fs.readFileSync('drizzle/0000_glorious_bug.sql','utf8').split('--> statement-breakpoint'))if(s.trim())db.exec(s.trim());console.log('applied')"
-```
+`tests/history.test.mjs` runs against PGlite — real Postgres in WASM, offline.
+That is deliberate: the suite used to run on SQLite while production ran D1, and
+upsert and timestamp semantics are exactly the kind that differ by dialect.
 
 ## Email alerts (needs configuration)
 
@@ -158,16 +183,10 @@ and it says so rather than pretending:
 - `POST /api/alerts` returns 503 rather than accepting an address it could never
   mail. Storing addresses you cannot deliver to is the failure worth avoiding.
 
-To turn it on, set two Worker secrets:
-
-```bash
-npx wrangler secret put RESEND_API_KEY
-npx wrangler secret put ALERTS_FROM_EMAIL
-```
-
+To turn it on, set `RESEND_API_KEY` and `ALERTS_FROM_EMAIL` — plus
+`DATABASE_URL`, since subscriptions have to be stored somewhere.
 `ALERTS_FROM_EMAIL` must be a sender verified with your provider, e.g.
-`NurseLaunch <alerts@yourdomain.com>`. For local development put both in a
-`.dev.vars` file (gitignored).
+`NurseLaunch <alerts@yourdomain.com>`. Locally, put them in `.env.local`.
 
 Swapping providers means rewriting one `fetch` in `lib/jobs/email.mjs`.
 
@@ -179,11 +198,15 @@ Design notes:
   the address.
 - **No enumeration.** Subscribing an existing address, and unsubscribing an
   unknown token, both return exactly what a first-time request returns.
-- **No cron, so digests ride on traffic.** There are no Cron Triggers on this
-  platform, so a digest run piggybacks on the background feed rebuild. Each
-  subscriber is paced by their own `lastSentAt` watermark rather than a clock —
-  so a site with daily visitors sends daily digests, and a site nobody visits
-  sends none. That is a real limitation, not a detail.
+- **Digests run on a real schedule.** `vercel.json` points Vercel Cron at
+  `/api/cron/digest` daily. On Workers there was no scheduler, so sends had to
+  piggyback on feed rebuilds and a site nobody visited mailed nobody; that
+  limitation is gone. Each subscriber is still paced by their own `lastSentAt`
+  watermark, so the job is idempotent — a retry cannot double-send, and a missed
+  run is picked up by the next.
+- **The cron endpoint fails closed.** It refuses to run unless `CRON_SECRET` is
+  set and presented as a bearer token. A public URL that mails every subscriber
+  on request is worse than one that does nothing.
 - **The watermark only advances after a confirmed send**, so a provider outage
   delays a digest instead of silently dropping those roles from it.
 - Unsubscribe is a `GET` on purpose: it has to work from an email client with no
@@ -213,13 +236,14 @@ publisher. When updating a figure, change its `period` and the module's
   tables and their migrations
 - `tests/` — `job-matching` covers the parsers, `ats` the two-ATS registry and
   the Oracle adapter's normalisation, `feed-policy` the cache decisions,
-  `history` the D1 semantics against real SQLite, `alerts` the subscription and
-  digest rules, `api-routes`/`alert-routes` request validation, `rendered-html`
-  the server-rendered shell. All offline.
-- `bindings.json` declares the optional D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development, and
-  `build/package-migrations.ts` copies `drizzle/` into the build output
-- `examples/d1/` is the starter's original opt-in D1 example, kept for reference
+  `history` the Postgres semantics against PGlite, `alerts` the subscription and
+  digest rules, `statistics` the sourcing rules for the published figures.
+- `tests/http-routes.test.mjs` is the only suite that needs the build: it boots
+  one `next start` and drives request validation, the alert routes, the cron
+  guard and the server-rendered shell over HTTP. No network beyond localhost.
+- `lib/db.mjs` — the Postgres handle, and the one place that decides whether a
+  database exists at all
+- `vercel.json` — the digest cron schedule
 
 ## Editing the matchers
 
@@ -238,12 +262,14 @@ Run `npm test` after any change to these.
 ## Useful Commands
 
 - `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build, then run every suite in `tests/` (no network required)
+- `npm run build`: production build
+- `npm test`: build, then run every suite in `tests/` (no external network)
 - `npm run lint`: ESLint over the project
-- `npm run db:generate`: generate Drizzle migrations after schema changes
+- `npm run db:generate`: generate Drizzle migrations after a schema change
+- `npm run db:migrate`: apply migrations to `DATABASE_URL`
 
 ## Learn More
 
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+- [Next.js App Router](https://nextjs.org/docs/app)
+- [Drizzle with Postgres](https://orm.drizzle.team/docs/get-started-postgresql)
+- [Vercel Cron Jobs](https://vercel.com/docs/cron-jobs)

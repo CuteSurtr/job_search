@@ -60,8 +60,14 @@ export type FeedMeta = {
   failedSources: string[];
   failureReasons: { source: string; reason: string }[];
   enrichedCount: number;
-  /** True when D1 sighting history backed this scan's posting ages. */
+  /** True when Postgres sighting history backed this scan's posting ages. */
   historyTracked?: boolean;
+  /**
+   * True when a shared cache (Vercel KV / Upstash) is configured. Without it
+   * each serverless instance keeps its own in-memory copy and rebuilds on every
+   * cold start.
+   */
+  sharedCache?: boolean;
   /** Every state where at least one polled employer operates. */
   coveredStates?: string[];
   cacheSeconds: number;

@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
-import { DatabaseSync } from "node:sqlite";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import test from "node:test";
-import { drizzle } from "drizzle-orm/d1";
+import { PGlite } from "@electric-sql/pglite";
+import { drizzle } from "drizzle-orm/pglite";
 
 import { jobSightings } from "../db/schema.ts";
 import {
-  D1_MAX_VARIABLES,
   INSERT_CHUNK,
+  MAX_BIND_PARAMS,
   SELECT_CHUNK,
   SIGHTING_COLUMNS,
   ageMinutes,
@@ -15,48 +17,33 @@ import {
 } from "../lib/jobs/history.mjs";
 
 /**
- * Minimal D1 surface over node:sqlite — prepare/bind/run/all plus batch, which
- * is everything drizzle's D1 driver calls. Lets the real migration and the real
- * queries run offline.
+ * These run against PGlite — a real Postgres compiled to WASM, in-process and
+ * offline. That matters more than it sounds: this suite previously ran on
+ * SQLite while production ran D1, and the semantics being asserted here (upsert
+ * preserving first_seen_at, timestamptz comparison in closeMissing, `excluded.`
+ * references) are exactly the kind that differ between dialects. Now the test
+ * dialect and the deployed dialect are the same one.
  */
-function fakeD1(sqlite) {
-  const exec = (sql, params) => sqlite.prepare(sql).all(...params);
-  const statement = (sql, params = []) => ({
-    async run() {
-      sqlite.prepare(sql).run(...params);
-      return { success: true, meta: {} };
-    },
-    async all() {
-      return { results: exec(sql, params), success: true, meta: {} };
-    },
-    async first() {
-      return exec(sql, params)[0] ?? null;
-    },
-    async raw() {
-      return exec(sql, params).map((row) => Object.values(row));
-    },
-  });
 
-  return {
-    prepare(sql) {
-      return { ...statement(sql), bind: (...params) => statement(sql, params) };
-    },
-    async batch(statements) {
-      const out = [];
-      for (const item of statements) out.push(await item.all());
-      return out;
-    },
-  };
+const MIGRATIONS = fileURLToPath(new URL("../drizzle/", import.meta.url));
+
+/** Read whatever drizzle-kit generated, so regenerating does not break this. */
+function migrationSql() {
+  const files = readdirSync(MIGRATIONS)
+    .filter((name) => name.endsWith(".sql"))
+    .sort();
+  assert.ok(files.length > 0, "no migration found in drizzle/");
+  return files.map((name) => readFileSync(path.join(MIGRATIONS, name), "utf8")).join("\n");
 }
 
-function freshDb() {
-  const sqlite = new DatabaseSync(":memory:");
-  const migration = readFileSync(new URL("../drizzle/0000_glorious_bug.sql", import.meta.url), "utf8");
-  for (const statement of migration.split("--> statement-breakpoint")) {
+async function freshDb() {
+  const client = new PGlite();
+  await client.waitReady;
+  for (const statement of migrationSql().split("--> statement-breakpoint")) {
     const trimmed = statement.trim();
-    if (trimmed) sqlite.exec(trimmed);
+    if (trimmed) await client.exec(trimmed);
   }
-  return { sqlite, db: drizzle(fakeD1(sqlite), { schema: { jobSightings } }) };
+  return { client, db: drizzle(client, { schema: { jobSightings } }) };
 }
 
 const job = (id, overrides = {}) => ({
@@ -71,19 +58,31 @@ const job = (id, overrides = {}) => ({
   ...overrides,
 });
 
-const rows = (sqlite) =>
-  Object.fromEntries(
-    sqlite
-      .prepare("select id, first_seen_at, last_seen_at, closed_at, title from job_sightings")
-      .all()
-      .map((row) => [row.id, row]),
+/** Timestamps come back as Date objects; compare them as ISO strings. */
+const iso = (value) => (value instanceof Date ? value.toISOString() : value);
+
+async function rows(client) {
+  const result = await client.query(
+    "select id, first_seen_at, last_seen_at, closed_at, title from job_sightings",
   );
+  return Object.fromEntries(
+    result.rows.map((row) => [
+      row.id,
+      {
+        ...row,
+        first_seen_at: iso(row.first_seen_at),
+        last_seen_at: iso(row.last_seen_at),
+        closed_at: iso(row.closed_at),
+      },
+    ]),
+  );
+}
 
 test("a first scan records every posting as newly seen and open", async () => {
-  const { sqlite, db } = freshDb();
+  const { client, db } = await freshDb();
   const firstSeen = await recordSightingWith(db, [job("a"), job("b")], "2026-08-01T10:00:00.000Z");
 
-  const stored = rows(sqlite);
+  const stored = await rows(client);
   assert.equal(Object.keys(stored).length, 2);
   assert.equal(stored.a.first_seen_at, "2026-08-01T10:00:00.000Z");
   assert.equal(stored.a.closed_at, null);
@@ -91,11 +90,11 @@ test("a first scan records every posting as newly seen and open", async () => {
 });
 
 test("a later scan advances last-seen but never rewrites first-seen", async () => {
-  const { sqlite, db } = freshDb();
+  const { client, db } = await freshDb();
   await recordSightingWith(db, [job("a")], "2026-08-01T10:00:00.000Z");
   const firstSeen = await recordSightingWith(db, [job("a")], "2026-08-05T10:00:00.000Z");
 
-  const stored = rows(sqlite);
+  const stored = await rows(client);
   // This is the entire point of the table: the original sighting must survive.
   assert.equal(stored.a.first_seen_at, "2026-08-01T10:00:00.000Z");
   assert.equal(stored.a.last_seen_at, "2026-08-05T10:00:00.000Z");
@@ -103,28 +102,28 @@ test("a later scan advances last-seen but never rewrites first-seen", async () =
 });
 
 test("a posting that stops appearing is marked closed", async () => {
-  const { sqlite, db } = freshDb();
+  const { client, db } = await freshDb();
   await recordSightingWith(db, [job("a"), job("b")], "2026-08-01T10:00:00.000Z");
   await recordSightingWith(db, [job("a")], "2026-08-02T10:00:00.000Z");
 
-  const stored = rows(sqlite);
+  const stored = await rows(client);
   assert.equal(stored.a.closed_at, null, "still listed");
   assert.equal(stored.b.closed_at, "2026-08-02T10:00:00.000Z", "no longer listed");
 });
 
 test("a reposted role reopens instead of staying closed", async () => {
-  const { sqlite, db } = freshDb();
+  const { client, db } = await freshDb();
   await recordSightingWith(db, [job("a"), job("b")], "2026-08-01T10:00:00.000Z");
   await recordSightingWith(db, [job("a")], "2026-08-02T10:00:00.000Z");
   await recordSightingWith(db, [job("a"), job("b")], "2026-08-03T10:00:00.000Z");
 
-  const stored = rows(sqlite);
+  const stored = await rows(client);
   assert.equal(stored.b.closed_at, null);
   assert.equal(stored.b.first_seen_at, "2026-08-01T10:00:00.000Z", "original sighting preserved");
 });
 
 test("an employer that did not respond does not have its roles closed", async () => {
-  const { sqlite, db } = freshDb();
+  const { client, db } = await freshDb();
   await recordSightingWith(
     db,
     [job("a", { sourceKey: "ochsner" }), job("b", { sourceKey: "sentara" })],
@@ -133,38 +132,39 @@ test("an employer that did not respond does not have its roles closed", async ()
   // Sentara is missing from this scan entirely — an outage, not a closed role.
   await recordSightingWith(db, [job("a", { sourceKey: "ochsner" })], "2026-08-02T10:00:00.000Z");
 
-  const stored = rows(sqlite);
+  const stored = await rows(client);
   assert.equal(stored.b.closed_at, null, "an unreachable source must not mass-close its listings");
 });
 
 test("changed posting details are refreshed on re-sighting", async () => {
-  const { sqlite, db } = freshDb();
+  const { client, db } = await freshDb();
   await recordSightingWith(db, [job("a", { title: "Old title" })], "2026-08-01T10:00:00.000Z");
   await recordSightingWith(db, [job("a", { title: "New title" })], "2026-08-02T10:00:00.000Z");
 
-  assert.equal(rows(sqlite).a.title, "New title");
+  assert.equal((await rows(client)).a.title, "New title");
 });
 
-test("batches stay under D1's bound-variable ceiling", () => {
-  // Local SQLite allows ~32k variables, so an oversized batch passes every test
-  // above and only fails in production with "D1_ERROR: too many SQL variables".
-  // That is exactly what happened at 60 rows per insert (600 variables).
-  const insertParams = INSERT_CHUNK * SIGHTING_COLUMNS + 2;
+test("batches stay well inside Postgres's bound-parameter ceiling", () => {
+  // Postgres allows 65535 parameters per statement, so unlike D1's ceiling of
+  // 100 this is not a cliff the batch sizes are pressed up against. The
+  // assertion is kept because the chunking still exists — a future edit that
+  // raises INSERT_CHUNK into the thousands should have to notice this.
+  const insertParams = INSERT_CHUNK * SIGHTING_COLUMNS;
   assert.ok(
-    insertParams <= D1_MAX_VARIABLES,
-    `insert batch binds ${insertParams} variables, over D1's ${D1_MAX_VARIABLES}`,
+    insertParams <= MAX_BIND_PARAMS,
+    `insert batch binds ${insertParams} parameters, over Postgres's ${MAX_BIND_PARAMS}`,
   );
-  assert.ok(SELECT_CHUNK <= D1_MAX_VARIABLES, "select batch binds one variable per id");
+  assert.ok(SELECT_CHUNK <= MAX_BIND_PARAMS, "select batch binds one parameter per id");
   assert.ok(INSERT_CHUNK >= 1 && SELECT_CHUNK >= 1);
 });
 
 test("a scan larger than one batch still records every posting", async () => {
-  const { sqlite, db } = freshDb();
-  const many = Array.from({ length: INSERT_CHUNK * 3 + 1 }, (_, index) => job(`job-${index}`));
+  const { client, db } = await freshDb();
+  const many = Array.from({ length: INSERT_CHUNK * 2 + 1 }, (_, index) => job(`job-${index}`));
   const firstSeen = await recordSightingWith(db, many, "2026-08-01T10:00:00.000Z");
 
   assert.notEqual(firstSeen, null, "a multi-batch scan must not fail");
-  assert.equal(Object.keys(rows(sqlite)).length, many.length);
+  assert.equal(Object.keys(await rows(client)).length, many.length);
   assert.equal(firstSeen.size, many.length);
 });
 
